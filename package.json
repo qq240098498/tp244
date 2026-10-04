@@ -6,7 +6,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node server/index.js"
+    "dev": "node server/index.js",
+    "verify": "node scripts/verify-attribution.js"
   },
   "dependencies": {
     "express": "^4.19.2"

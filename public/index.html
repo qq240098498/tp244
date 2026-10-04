@@ -24,6 +24,7 @@
     <button type="button" class="tab is-active" data-view="overview">概览</button>
     <button type="button" class="tab" data-view="rooms">冷库与探头</button>
     <button type="button" class="tab" data-view="batches">批次</button>
+    <button type="button" class="tab" data-view="ledger">设备占用账</button>
     <button type="button" class="tab" data-view="records">温度记录</button>
     <button type="button" class="tab" data-view="releases">放行台账</button>
   </nav>
@@ -96,18 +97,67 @@
         <div class="panel">
           <div class="panel-head">
             <h2>批次清单</h2>
-            <span class="panel-hint">点一行展开温度记录、超限段、断链与放行判定</span>
+            <div><button type="button" class="btn" data-action="batch-add">新增批次</button></div>
           </div>
           <div class="table-wrap">
             <table class="data-table">
               <thead>
                 <tr>
                   <th>批次号</th><th>品名</th><th>规格</th><th class="num">件数</th><th>所在冷库</th>
-                  <th>入库时刻</th><th>状态</th><th class="num">记录数</th><th class="num">最长超限</th>
+                  <th>入库时刻</th><th>状态</th><th class="num">记录数</th><th class="num">存疑</th>
+                  <th class="num">最长超限</th>
                   <th class="num">累计超限</th><th class="num">MKT</th><th class="num">断链数</th><th>放行情况</th>
                 </tr>
               </thead>
               <tbody id="batchRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="view" data-view="ledger" id="view-ledger">
+        <div class="policy-card" id="policyCard"></div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>探头占用时间轴</h2>
+            <span class="panel-hint">一种颜色一个批次；斜纹段是多个批次重叠的时段，悬停看切开后各计几条</span>
+          </div>
+          <div id="ledgerTimelines"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>设备占用账</h2>
+            <button type="button" class="btn" data-action="occ-add">登记占用</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>批次</th><th>设备</th><th>探头</th><th>开始</th><th>结束</th>
+                  <th class="num">时长(分)</th><th>来源</th><th>状态</th><th>备注</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="ledgerRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>重叠窗与切割结果</h2>
+            <span class="panel-hint">同一探头同一时段被多个批次占用时按当前口径裁决；存疑记录不计入任何批次并拦截放行</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>探头</th><th>重叠时段</th><th>先后（裁决依据排序）</th><th>切开后各得时段</th>
+                  <th class="num">已裁记录</th><th class="num">存疑记录</th><th>口径</th>
+                </tr>
+              </thead>
+              <tbody id="overlapRows"></tbody>
             </table>
           </div>
         </div>
@@ -125,7 +175,7 @@
               <thead>
                 <tr>
                   <th>批次</th><th>探头</th><th>时刻</th><th class="num">温度(℃)</th><th>来源</th>
-                  <th>登记人</th><th>是否超限</th><th>操作</th>
+                  <th>登记人</th><th>是否超限</th><th>归属</th><th>操作</th>
                 </tr>
               </thead>
               <tbody id="recordRows"></tbody>

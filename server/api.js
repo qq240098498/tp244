@@ -35,6 +35,12 @@ function overview(data) {
   const noRecordBatches = data.batches.filter((b) => !data.records.some((r) => r.batchId === b.id)).length;
   const expiredProbes = data.probes.filter((p) => !coldlib.probeValidOn(p, store.nowText().slice(0, 10))).length;
   const mktValues = decorated.map((d) => d.check.mkt).filter((v) => v > 0);
+  const unresolved = coldlib.unresolvedTotals(data);
+  let overlapCount = 0;
+  for (const p of data.probes) {
+    const timeline = coldlib.occupancyTimeline(data, { probeId: p.id });
+    overlapCount += timeline.devices.reduce((acc, dev) => acc + dev.windows.length, 0);
+  }
   return {
     today: store.nowText().slice(0, 10),
     roomCount: data.rooms.length,
@@ -53,6 +59,8 @@ function overview(data) {
     readyToRelease,
     blockedCount,
     noRecordBatches,
+    unresolvedRecordCount: unresolved.unresolved,
+    occupancyOverlapCount: overlapCount,
     maxMkt: mktValues.length ? store.round(Math.max.apply(null, mktValues)) : 0,
     averageMkt: mktValues.length ? store.round(mktValues.reduce((a, b) => a + b, 0) / mktValues.length) : 0,
     settings: {
@@ -80,7 +88,18 @@ router.get('/summary', withData((data) => overview(data)));
 router.get('/settings', withData((data) => data.settings));
 router.patch('/settings', withData((data, req) => {
   const patch = req.body || {};
+  const enums = {
+    overlapPolicy: ['midpoint', 'firstWins', 'suspend'],
+    boundaryPolicy: ['leftClosed', 'rightClosed'],
+    overlapTieBasis: ['occupyStart', 'loadedAt', 'recordFirst'],
+  };
+  for (const key of Object.keys(enums)) {
+    if (patch[key] !== undefined && !enums[key].includes(patch[key])) {
+      throw new AppError(400, 'VALIDATION_FAILED', '口径取值不对：' + key, { [key]: '只能是：' + enums[key].join('、') });
+    }
+  }
   for (const key of Object.keys(store.DEFAULT_SETTINGS)) if (patch[key] !== undefined) data.settings[key] = patch[key];
+  coldlib.invalidateAttribution(data);
   return { __save: true, __body: data.settings };
 }));
 
@@ -105,10 +124,23 @@ router.get('/batches/:id/release-check', withData((data, req) => {
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
   return coldlib.releaseCheck(data, batch);
 }));
+router.get('/batches/:id/attribution', withData((data, req) => {
+  const batch = data.batches.find((b) => b.id === req.params.id);
+  if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
+  return res.batchDetail(data, req.params.id).attribution;
+}));
 router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __body: res.decide(data, req.params.id, req.body || {}) })));
+
+router.get('/occupancies', withData((data, req) => res.listOccupancies(data, req.query)));
+router.post('/occupancies', withData((data, req) => ({ __save: true, __body: res.createOccupancy(data, req.body || {}) })));
+router.get('/occupancies/timeline', withData((data, req) => coldlib.occupancyTimeline(data, req.query)));
+router.patch('/occupancies/:id', withData((data, req) => ({ __save: true, __body: res.updateOccupancy(data, req.params.id, req.body || {}) })));
+router.delete('/occupancies/:id', withData((data, req) => ({ __save: true, __body: res.removeOccupancy(data, req.params.id) })));
+router.post('/occupancies/:id/split', withData((data, req) => ({ __save: true, __body: res.splitOccupancy(data, req.params.id, req.body || {}) })));
 
 router.get('/records', withData((data, req) => res.listRecords(data, req.query)));
 router.post('/records', withData((data, req) => ({ __save: true, __body: res.createRecord(data, req.body || {}) })));
+router.patch('/records/:id', withData((data, req) => ({ __save: true, __body: res.updateRecord(data, req.params.id, req.body || {}) })));
 router.delete('/records/:id', withData((data, req) => ({ __save: true, __body: res.removeRecord(data, req.params.id) })));
 
 router.get('/releases', withData((data, req) => res.listReleases(data, req.query)));
