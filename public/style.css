@@ -320,3 +320,17 @@ tr.row-detail > td { background: #f7fbfc; border-bottom: 1px solid var(--line); 
   .layout { flex-direction: column; }
   .filters { width: 100%; flex: 1 1 auto; position: static; }
 }
+
+/* ---------- 设备占用账：时间线 ---------- */
+.pill-info { color: var(--primary-dark); border-color: #9fc6d4; background: var(--primary-soft); }
+.pill-warn { color: #b96a00; border-color: #ecd29b; background: #fdf5e3; }
+.lane-block { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; background: var(--paper); }
+.lane-block h4 { margin: 0 0 8px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.lane-has-dispute::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 4px; align-self: center; }
+.slice-table tbody tr.slice-sole { background: var(--ok-soft); }
+.slice-table tbody tr.slice-overlap { background: var(--accent-soft); }
+.slice-table tbody tr.slice-gap { background: #f2f4f5; }
+.slice-table td { vertical-align: middle; }
+.problem-basis { color: var(--ink-soft); font-size: 12px; }
+.lane-block .mini-table { margin-bottom: 10px; }
+.lane-block .mini-table:last-child { margin-bottom: 0; }

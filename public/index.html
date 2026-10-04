@@ -24,6 +24,7 @@
     <button type="button" class="tab is-active" data-view="overview">概览</button>
     <button type="button" class="tab" data-view="rooms">冷库与探头</button>
     <button type="button" class="tab" data-view="batches">批次</button>
+    <button type="button" class="tab" data-view="occupancies">设备占用账</button>
     <button type="button" class="tab" data-view="records">温度记录</button>
     <button type="button" class="tab" data-view="releases">放行台账</button>
   </nav>
@@ -113,6 +114,34 @@
         </div>
       </div>
 
+      <div class="view" data-view="occupancies" id="view-occupancies">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>设备占用账</h2>
+            <button type="button" class="btn" data-action="occ-add">新增占用</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>批次</th><th>设备</th><th>探头</th><th>开始</th><th>结束</th>
+                  <th>用途</th><th>状态</th><th class="num">计入记录</th><th class="num">存疑记录</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="occRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>时间线切片账</h2>
+            <span class="panel-hint" id="timelineNote"></span>
+          </div>
+          <div id="timelineLanes"></div>
+        </div>
+      </div>
+
       <div class="view" data-view="records" id="view-records">
         <div class="panel">
           <div class="panel-head">
@@ -125,7 +154,7 @@
               <thead>
                 <tr>
                   <th>批次</th><th>探头</th><th>时刻</th><th class="num">温度(℃)</th><th>来源</th>
-                  <th>登记人</th><th>是否超限</th><th>操作</th>
+                  <th>登记人</th><th>是否超限</th><th>归属</th><th>操作</th>
                 </tr>
               </thead>
               <tbody id="recordRows"></tbody>

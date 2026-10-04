@@ -14,14 +14,57 @@ const DEFAULT_SETTINGS = {
   gasConstant: 8.314,
   probeCalibrationGraceDays: 0,
   recordIntervalMinutes: 15,
+  // 交叠裁决：window=按占用窗逐点切（交叠内核存疑）；first=先占先得；manual=交叠全部人工裁定
+  overlapPolicy: 'window',
+  // 边界时刻：front=首尾相接时交接点算前一批 [起,止]；back=算后一批 [起,止)
+  boundaryPolicy: 'front',
 };
+
+const DATA_VERSION = 2;
+
+// 版本迁移：为老数据补设备占用账——每个有记录的「批次×探头」按最早/最晚记录时刻补一条占用窗
+function migrateV2(data) {
+  if (!Array.isArray(data.occupancies)) data.occupancies = [];
+  if (!Array.isArray(data.attributionOverrides)) data.attributionOverrides = [];
+  if (data.occupancies.length === 0 && data.records.length) {
+    const groups = new Map();
+    for (const r of data.records) {
+      const batch = data.batches.find((b) => b.id === r.batchId);
+      if (!batch) continue;
+      const key = r.batchId + '|' + r.probeId;
+      let g = groups.get(key);
+      if (!g) {
+        g = { batchId: r.batchId, probeId: r.probeId, roomId: batch.roomId, startAt: r.at, endAt: r.at };
+        groups.set(key, g);
+      }
+      if (r.at < g.startAt) g.startAt = r.at;
+      if (r.at > g.endAt) g.endAt = r.at;
+    }
+    let n = 0;
+    for (const g of groups.values()) {
+      n += 1;
+      data.occupancies.push({
+        id: 'oc-' + String(n).padStart(4, '0'),
+        batchId: g.batchId,
+        roomId: g.roomId,
+        probeId: g.probeId,
+        startAt: g.startAt,
+        endAt: g.endAt,
+        purpose: '历史记录补登',
+        remark: '按已有温度记录的最早与最晚时刻自动补登',
+      });
+    }
+  }
+  data.version = DATA_VERSION;
+}
 
 function normalize(raw) {
   const data = raw && typeof raw === 'object' ? raw : {};
   data.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-  for (const key of ['rooms', 'probes', 'batches', 'records', 'releases']) {
+  for (const key of ['rooms', 'probes', 'batches', 'records', 'releases', 'occupancies', 'attributionOverrides']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
+  if (!Number(data.version) || Number(data.version) < DATA_VERSION) migrateV2(data);
   return data;
 }
 

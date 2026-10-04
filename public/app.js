@@ -9,6 +9,27 @@ const ROOM_STATUS = ['运行', '检修', '停用'];
 const ROOM_TYPE = ['冷藏库', '冷藏车', '冷冻库'];
 const PROBE_STATUS = ['在用', '停用', '送检'];
 const SOURCE_LIST = ['自动', '人工'];
+const OVERLAP_POLICIES = [
+  { value: 'window', label: '按占用窗逐点切（交叠存疑）' },
+  { value: 'first', label: '先占先得（交叠判给更早占用）' },
+  { value: 'manual', label: '交叠全部人工裁定' }
+];
+const BOUNDARY_POLICIES = [
+  { value: 'front', label: '交接点算前一批 [起, 止]' },
+  { value: 'back', label: '交接点算后一批 [起, 止)' }
+];
+const ATTR_FILTERS = [
+  { value: '', label: '全部' },
+  { value: 'confirmed', label: '归属明确' },
+  { value: 'boundary', label: '边界切分' },
+  { value: 'disputed', label: '交叠存疑' },
+  { value: 'out-of-window', label: '占用窗外' },
+  { value: 'device-mismatch', label: '设备对不上' },
+  { value: 'wrong-batch', label: '挂错批次' },
+  { value: 'manual-assigned', label: '人工计入' },
+  { value: 'manual-excluded', label: '人工剔除' },
+  { value: '__problems', label: '只看有问题' }
+];
 
 const state = {
   view: 'overview',
@@ -17,9 +38,12 @@ const state = {
   rooms: [],
   probes: [],
   batches: [],
+  occupancies: [],
   batchesView: [],
   recordsView: [],
   releasesView: [],
+  occupanciesView: [],
+  timeline: null,
   roomDetail: {},
   batchDetail: {},
   batchOut: {},
@@ -29,7 +53,8 @@ const state = {
   filters: {
     rooms: { status: '', type: '', keyword: '', probeStatus: '', probeCal: 'all' },
     batches: { status: '', roomId: '', product: '', noRecord: false },
-    records: { batchId: '', probeId: '', source: '', from: '', to: '' },
+    occupancies: { roomId: '', probeId: '' },
+    records: { batchId: '', probeId: '', source: '', from: '', to: '', attribution: '' },
     releases: { decision: '' }
   }
 };
@@ -182,6 +207,7 @@ async function loadView(view) {
     if (view === 'overview') await loadOverview();
     else if (view === 'rooms') await loadRoomsView();
     else if (view === 'batches') await loadBatchesView();
+    else if (view === 'occupancies') await loadOccupanciesView();
     else if (view === 'records') await loadRecordsView();
     else if (view === 'releases') await loadReleasesView();
   } catch (err) { showError(err); }
@@ -213,6 +239,7 @@ function renderOverview() {
     { title: '温度记录', value: s.recordCount, sub: '人工 ' + s.manualRecordCount, go: { view: 'records' } },
     { title: '放行 / 拒收', value: s.releasedCount + ' / ' + s.rejectedCount, sub: '台账 ' + s.releaseCount + ' 条', go: { view: 'releases' } },
     { title: '满足放行条件', value: s.readyToRelease, sub: '被挡下 ' + s.blockedCount, go: { view: 'batches' } },
+    { title: '归属有问题批次', value: s.attributionProblemBatchCount, sub: '存疑/错位/窗外/挂错，占用账可查', go: { view: 'occupancies' } },
     { title: '没有温度记录', value: s.noRecordBatches, sub: '个批次', go: { view: 'batches', noRecord: true } },
     { title: 'MKT', value: s.maxMkt, sub: '平均 ' + s.averageMkt, go: { view: 'batches' } }
   ];
@@ -399,12 +426,12 @@ function batchDetailRow(b) {
   const out = state.batchOut[b.id] || {};
 
   const records = (d.records || []).map(function (r) {
-    const oor = out[r.id];
     return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
       '<td>' + esc(r.source) + '</td>' +
-      '<td>' + (oor ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
-      '<td>' + (r.probeExpired ? pill('已过期', 'pill-bad') : pill('有效', 'pill-mute')) + '</td></tr>';
-  }).join('') || '<tr><td colspan="6" class="empty">没有温度记录</td></tr>';
+      '<td>' + (out[r.id] ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
+      '<td>' + (r.probeExpired ? pill('已过期', 'pill-bad') : pill('有效', 'pill-mute')) + '</td>' +
+      '<td>' + attrPill(r.attribution) + '</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="empty">没有温度记录</td></tr>';
 
   let segmentsHtml;
   if (d.segmentsUnavailable) {
@@ -425,16 +452,41 @@ function batchDetailRow(b) {
 
   const check = d.releaseCheck || {};
   const conds = (check.conditions || []).slice();
-  const expired = check.expiredProbes || [];
-  conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
+  if (!conds.some(function (c) { return c.key === 'calibration'; })) {
+    const expired = check.expiredProbes || [];
+    conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
+  }
   const condHtml = conds.map(function (c) {
     return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
       '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
   }).join('');
 
+  const expired = check.expiredProbes || [];
   const expiredProbes = expired.map(function (p) {
     return '<tr><td>' + esc(p.probeCode) + '</td><td>' + esc(p.calibratedUntil) + '</td><td>' + esc(p.at) + '</td></tr>';
   }).join('') || '<tr><td colspan="3" class="empty">没有已过校准期的探头</td></tr>';
+
+  const occRows = (d.occupancies || []).map(function (w) {
+    return '<tr class="' + (w.disputedRecordCount > 0 ? 'row-danger' : '') + '">' +
+      '<td>' + esc(w.roomCode) + '</td><td>' + (w.probeCode ? esc(w.probeCode) : '无探头') + '</td>' +
+      '<td>' + esc(w.startAt) + '</td><td>' + (w.active ? '进行中' : esc(w.endAt)) + '</td>' +
+      '<td>' + esc(w.purpose) + '</td><td class="num">' + num(w.attributedRecordCount) + '</td>' +
+      '<td class="num">' + (w.disputedRecordCount > 0 ? pill(String(w.disputedRecordCount), 'pill-bad') : '0') + '</td>' +
+      '<td><button type="button" class="btn btn-sm" data-action="occ-edit" data-id="' + esc(w.id) + '">修改</button>' +
+      (w.active ? '<button type="button" class="btn btn-sm" data-action="occ-end" data-id="' + esc(w.id) + '">结束</button>' : '') +
+      '<button type="button" class="btn btn-sm btn-danger" data-action="occ-del" data-id="' + esc(w.id) + '">删除</button></td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">还没有登记设备占用，温度记录会全部落在占用窗外</td></tr>';
+
+  const problemRows = (d.problemRecords || []).map(function (r) {
+    const a = r.attribution || {};
+    return '<tr class="row-danger"><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
+      '<td>' + attrPill(a) + '</td><td class="problem-basis">' + esc(a.basis || '') + '</td>' +
+      '<td class="cell-actions">' +
+      (a.overrideId ? '<button type="button" class="btn btn-sm" data-action="ovr-revoke" data-id="' + esc(a.overrideId) + '">撤销改判</button>' : '') +
+      '<button type="button" class="btn btn-sm" data-action="ovr-assign" data-id="' + esc(r.id) + '">改判计入</button>' +
+      '<button type="button" class="btn btn-sm" data-action="ovr-exclude" data-id="' + esc(r.id) + '">剔除</button>' +
+      '</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="empty">没有归属有问题的记录</td></tr>';
 
   const releases = (d.releases || []).map(function (r) {
     return '<tr><td>' + esc(r.decision) + '</td><td>' + esc(r.decidedAt) + '</td><td>' + esc(r.decider) + '</td>' +
@@ -449,8 +501,12 @@ function batchDetailRow(b) {
 
   return '<tr class="row-detail"><td colspan="13">' +
     '<div class="detail-grid">' +
-    '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '）</h4>' +
-    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
+    '<div class="detail-block"><h4>设备占用段（' + (d.occupancies || []).length + '）<button type="button" class="btn btn-sm" data-action="occ-addbatch" data-id="' + esc(b.id) + '">新增占用</button></h4>' +
+    '<table class="mini-table"><thead><tr><th>设备</th><th>探头</th><th>开始</th><th>结束</th><th>用途</th><th class="num">计入</th><th class="num">存疑</th><th>操作</th></tr></thead><tbody>' + occRows + '</tbody></table></div>' +
+    '<div class="detail-block"><h4>温度记录（' + (d.records || []).length + '），参与判定 ' + ((d.releaseCheck && d.releaseCheck.recordCount) || 0) + ' 条</h4>' +
+    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度(℃)</th><th>来源</th><th>是否超限</th><th>探头是否过期</th><th>归属</th></tr></thead><tbody>' + records + '</tbody></table></div>' +
+    '<div class="detail-block"><h4>归属有问题记录（' + (d.problemRecords || []).length + '）<span class="panel-hint">不计入判定，放行会被挡住</span></h4>' +
+    '<table class="mini-table"><thead><tr><th>时刻</th><th>探头</th><th class="num">温度</th><th>归属</th><th>依据</th><th>操作</th></tr></thead><tbody>' + problemRows + '</tbody></table></div>' +
     '<div class="detail-block"><h4>超限段（' + (d.segments || []).length + '）</h4>' + segmentsHtml +
     '<h4>断链缺口（' + (d.chainGaps || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">实际(分)</th><th class="num">计入(分)</th></tr></thead><tbody>' + gaps + '</tbody></table></div>' +
@@ -495,6 +551,8 @@ async function expandBatch(id) {
         effectiveRecords: [],
         segments: [],
         segmentsUnavailable: true,
+        occupancies: [],
+        problemRecords: [],
         chainGaps: (check.chain && check.chain.gaps) || [],
         releases: fallback[2] || [],
         releaseCheck: check,
@@ -511,6 +569,169 @@ async function expandBatch(id) {
   renderBatchRows();
 }
 
+/* ---------- 设备占用账 ---------- */
+
+function attrPill(a) {
+  if (!a) return pill('未裁决', 'pill-mute');
+  const map = {
+    'confirmed': 'pill-ok',
+    'boundary': 'pill-info',
+    'disputed': 'pill-bad',
+    'out-of-window': 'pill-warn',
+    'device-mismatch': 'pill-bad',
+    'wrong-batch': 'pill-warn',
+    'manual-assigned': 'pill-info',
+    'manual-excluded': 'pill-mute'
+  };
+  const tip = a.basis ? ' title="' + esc(a.basis) + '"' : '';
+  let text = a.statusText || a.status;
+  if (a.chargedBatchCode && a.counted && !a.boundary) text += '→' + a.chargedBatchCode;
+  if (a.boundary && text.indexOf('边界') < 0) text += '（边界）';
+  return '<span class="pill ' + (map[a.status] || 'pill-mute') + '"' + tip + '>' + esc(text) + '</span>';
+}
+
+// 对记录挂账批次来说需要处理的：不计入的各种问题，或计入了别的批次（挂错批次）
+function attributionProblemFor(r) {
+  const a = r.attribution;
+  return !!a && (!a.counted || (!!a.chargedBatchId && a.chargedBatchId !== r.batchId));
+}
+
+async function loadOccupanciesView() {
+  const f = state.filters.occupancies;
+  const params = new URLSearchParams();
+  if (f.roomId) params.set('roomId', f.roomId);
+  if (f.probeId) params.set('probeId', f.probeId);
+  const qs = params.toString() ? '?' + params.toString() : '';
+  const results = await Promise.all([
+    api('GET', '/api/occupancies' + qs),
+    api('GET', '/api/occupancies/timeline' + qs)
+  ]);
+  state.occupanciesView = results[0];
+  state.timeline = results[1];
+  renderOccRows();
+  renderTimeline();
+}
+
+function renderOccRows() {
+  const rows = state.occupanciesView || [];
+  const tbody = $('occRows');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有设备占用，先给批次登记占用的设备、探头与时段</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (w) {
+    const overlapNote = (w.disputedRecordCount > 0) ? pill('有存疑 ' + w.disputedRecordCount, 'pill-bad') : pill('无存疑', 'pill-ok');
+    return '<tr class="row-main' + (w.disputedRecordCount > 0 ? ' row-danger' : '') + '" data-rowkind="occ" data-id="' + esc(w.id) + '">' +
+      '<td>' + esc(w.batchCode) + '</td>' +
+      '<td>' + esc(w.roomCode) + '</td>' +
+      '<td>' + (w.probeCode ? esc(w.probeCode) : pill('无探头', 'pill-mute')) + '</td>' +
+      '<td>' + esc(w.startAt) + '</td>' +
+      '<td>' + (w.active ? pill('进行中', 'pill-info') : esc(w.endAt)) + '</td>' +
+      '<td>' + esc(w.purpose) + '</td>' +
+      '<td>' + (w.active ? '进行中' : '已结束') + '</td>' +
+      '<td class="num">' + num(w.attributedRecordCount) + '</td>' +
+      '<td class="num">' + overlapNote + '</td>' +
+      '<td class="cell-actions">' +
+      '<button type="button" class="btn btn-sm" data-action="occ-edit" data-id="' + esc(w.id) + '">修改</button>' +
+      (w.active ? '<button type="button" class="btn btn-sm" data-action="occ-end" data-id="' + esc(w.id) + '">结束</button>' : '') +
+      '<button type="button" class="btn btn-sm btn-danger" data-action="occ-del" data-id="' + esc(w.id) + '">删除</button>' +
+      '</td></tr>';
+  }).join('');
+}
+
+function renderTimeline() {
+  const t = state.timeline;
+  const host = $('timelineLanes');
+  if (!t) return;
+  $('timelineNote').textContent = '当前口径：交叠「' + overlapLabel(t.overlapPolicy) + '」；边界「' + boundaryLabel(t.boundaryPolicy) + '」';
+  const lanes = t.lanes || [];
+  if (!lanes.length) {
+    host.innerHTML = '<div class="detail-note">当前筛选下没有占用窗</div>';
+    return;
+  }
+  host.innerHTML = lanes.map(function (lane) {
+    const probe = state.probes.find(function (p) { return p.id === lane.probeId; });
+    const probeText = lane.probeId ? ((probe ? probe.code : lane.probeId) + (probe ? '（' + probe.position + '）' : '')) : '无探头占用';
+    const winRows = lane.windows.map(function (w) {
+      const overlaps = (w.overlaps || []).map(function (o) {
+        const b = state.batches.find(function (x) { return x.id === o.batchId; });
+        return esc(b ? b.code : o.batchId);
+      }).join('、');
+      return '<tr class="' + (w.overlaps.length ? 'row-danger' : '') + '">' +
+        '<td class="num">' + num(w.order) + '</td><td>' + esc(batchCodeById(w.batchId)) + '</td>' +
+        '<td>' + esc(roomCodeById(w.roomId)) + '</td>' +
+        '<td>' + esc(w.startAt) + '</td><td>' + (w.open ? '进行中' : esc(w.endAt)) + '</td>' +
+        '<td>' + esc(w.purpose) + '</td>' +
+        '<td>' + (overlaps ? '与 ' + overlaps + ' 重叠' : pill('独占', 'pill-ok')) + '</td></tr>';
+    }).join('');
+    const sliceRows = lane.slices.map(function (s) {
+      const cls = s.kind === 'overlap' ? 'slice-overlap' : (s.kind === 'gap' ? 'slice-gap' : 'slice-sole');
+      const kindText = s.kind === 'overlap' ? pill('交叠', 'pill-bad') : (s.kind === 'gap' ? pill('空档', 'pill-mute') : pill('独占', 'pill-ok'));
+      const occupants = s.occupancies.map(function (o) {
+        return '#' + o.order + ' ' + esc(batchCodeById(o.batchId));
+      }).join('、') || '—';
+      return '<tr class="' + cls + '"><td>' + esc(s.startAt) + '</td><td>' + esc(s.endAt) + '</td>' +
+        '<td>' + kindText + '</td><td>' + occupants + '</td>' +
+        '<td class="num">' + num(s.recordCount) + '</td><td class="num">' + num(s.countedRecordCount) + '</td>' +
+        '<td class="num">' + (s.disputedRecordCount > 0 ? pill(String(s.disputedRecordCount), 'pill-bad') : '0') + '</td></tr>';
+    }).join('');
+    return '<div class="lane-block' + (lane.disputedRecordCount > 0 ? ' lane-has-dispute' : '') + '">' +
+      '<h4>' + esc(probeText) + ' <span class="panel-hint">占用窗 ' + lane.windowCount + ' 条、交叠片 ' + lane.overlapSliceCount + ' 段、存疑记录 ' + lane.disputedRecordCount + ' 条（按开始时刻排先后）</span></h4>' +
+      '<table class="mini-table"><thead><tr><th class="num">序</th><th>批次</th><th>设备</th><th>开始</th><th>结束</th><th>用途</th><th>与谁重叠</th></tr></thead><tbody>' + winRows + '</tbody></table>' +
+      '<table class="mini-table slice-table"><thead><tr><th>片起</th><th>片止</th><th>片型</th><th>占用者（谁先谁后）</th><th class="num">记录</th><th class="num">计入</th><th class="num">存疑</th></tr></thead><tbody>' + sliceRows + '</tbody></table>' +
+      '</div>';
+  }).join('');
+}
+
+function overlapLabel(v) {
+  const o = OVERLAP_POLICIES.find(function (x) { return x.value === v; });
+  return o ? o.label : v;
+}
+function boundaryLabel(v) {
+  const o = BOUNDARY_POLICIES.find(function (x) { return x.value === v; });
+  return o ? o.label : v;
+}
+function batchCodeById(id) {
+  const b = state.batches.find(function (x) { return x.id === id; });
+  return b ? b.code : id;
+}
+function roomCodeById(id) {
+  const r = state.rooms.find(function (x) { return x.id === id; });
+  return r ? r.code : id;
+}
+
+function openOccupancyForm(occ, defaultBatchId) {
+  const isEdit = !!occ;
+  const w = occ || { batchId: defaultBatchId || '', roomId: '', probeId: '', startAt: '', endAt: '', purpose: '', remark: '' };
+  if (!isEdit && w.batchId) {
+    const b = state.batches.find(function (x) { return x.id === w.batchId; });
+    if (b) w.roomId = b.roomId;
+  }
+  const body =
+    '<div class="field"><label>批次</label><select data-field="batchId"' + (isEdit ? ' disabled' : '') + '>' + batchOptions(w.batchId) + '</select></div>' +
+    '<div class="field"><label>设备（冷库/车厢）</label><select data-field="roomId">' + roomOptions(w.roomId) + '</select></div>' +
+    '<div class="field"><label>探头</label><select data-field="probeId"><option value="">占了设备但无探头</option>' +
+      state.probes.map(function (p) { return '<option value="' + esc(p.id) + '"' + (p.id === w.probeId ? ' selected' : '') + '>' + esc(p.code + '（' + (p.roomCode || '') + ' ' + p.position + '）') + '</option>'; }).join('') +
+      '</select><div class="field-hint">探头与设备当前挂不一致也能登记，错位时段会在判定里标「设备对不上」</div></div>' +
+    '<div class="field"><label>开始时刻</label><input type="text" data-field="startAt" value="' + esc(w.startAt) + '" placeholder="2026-09-14 05:00:00"></div>' +
+    '<div class="field"><label>结束时刻</label><input type="text" data-field="endAt" value="' + esc(w.endAt) + '" placeholder="留空表示进行中"></div>' +
+    '<div class="field"><label>用途</label><input type="text" data-field="purpose" value="' + esc(w.purpose) + '" placeholder="第一趟 / 第二趟 / 搬库"></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark">' + esc(w.remark) + '</textarea></div>';
+  openModal(isEdit ? '修改设备占用' : '新增设备占用', body, isEdit ? '保存' : '新增', async function () {
+    const v = formValues();
+    const payload = {
+      batchId: v.batchId, roomId: v.roomId, probeId: v.probeId,
+      startAt: v.startAt, endAt: v.endAt, purpose: v.purpose, remark: v.remark
+    };
+    try {
+      if (isEdit) await api('PATCH', '/api/occupancies/' + encodeURIComponent(occ.id), payload);
+      else await api('POST', '/api/occupancies', payload);
+      closeModal();
+      await refreshAfterMutation();
+    } catch (err) { showError(err); }
+  });
+}
+
 /* ---------- 温度记录 ---------- */
 
 async function loadRecordsView() {
@@ -521,20 +742,23 @@ async function loadRecordsView() {
   if (f.source) params.set('source', f.source);
   if (f.from) params.set('from', toApiTime(f.from));
   if (f.to) params.set('to', toApiTime(f.to));
+  if (f.attribution === '__problems') params.set('onlyProblems', 'true');
+  else if (f.attribution) params.set('status', f.attribution);
   const rows = await api('GET', '/api/records' + (params.toString() ? '?' + params.toString() : ''));
   state.recordsView = rows;
   const batchSelected = !!f.batchId;
   const shown = batchSelected ? rows : rows.slice(0, RECORD_PAGE);
   $('recordsNote').textContent = batchSelected
-    ? ('共 ' + rows.length + ' 条，已全部显示')
-    : ('共 ' + rows.length + ' 条，已显示前 ' + Math.min(RECORD_PAGE, rows.length) + ' 条');
+    ? ('共 ' + rows.length + ' 条，已全部显示；归属列鼠标悬停可看裁决依据')
+    : ('共 ' + rows.length + ' 条，已显示前 ' + Math.min(RECORD_PAGE, rows.length) + ' 条；归属列鼠标悬停可看裁决依据');
   const tbody = $('recordRows');
   if (!shown.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty">没有符合条件的温度记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">没有符合条件的温度记录</td></tr>';
     return;
   }
   tbody.innerHTML = shown.map(function (r) {
-    return '<tr class="row-main" data-rowkind="record" data-id="' + esc(r.id) + '">' +
+    const problem = attributionProblemFor(r);
+    return '<tr class="row-main' + (problem ? ' row-danger' : '') + '" data-rowkind="record" data-id="' + esc(r.id) + '">' +
       '<td>' + esc(r.batchCode) + '</td>' +
       '<td>' + esc(r.probeCode) + '</td>' +
       '<td>' + esc(r.at) + '</td>' +
@@ -542,8 +766,14 @@ async function loadRecordsView() {
       '<td>' + esc(r.source) + '</td>' +
       '<td>' + esc(r.operator) + '</td>' +
       '<td>' + (r.outOfRange ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
-      '<td class="cell-actions"><button type="button" class="btn btn-sm btn-danger" data-action="record-del" data-id="' + esc(r.id) + '">删除</button></td>' +
-      '</tr>';
+      '<td>' + attrPill(r.attribution) + '</td>' +
+      '<td class="cell-actions">' +
+      (r.attribution && r.attribution.overrideId
+        ? '<button type="button" class="btn btn-sm" data-action="ovr-revoke" data-id="' + esc(r.attribution.overrideId) + '">撤销改判</button>' : '') +
+      (problem ? '<button type="button" class="btn btn-sm" data-action="ovr-assign" data-id="' + esc(r.id) + '">改判计入</button>' +
+        '<button type="button" class="btn btn-sm" data-action="ovr-exclude" data-id="' + esc(r.id) + '">剔除</button>' : '') +
+      '<button type="button" class="btn btn-sm btn-danger" data-action="record-del" data-id="' + esc(r.id) + '">删除</button>' +
+      '</td></tr>';
   }).join('');
 }
 
@@ -625,6 +855,14 @@ function renderFilters() {
       '<div class="filter-field"><label>所在冷库</label>' + selectHtml('roomId', roomSel, f.roomId) + '</div>' +
       '<div class="filter-field"><label>品名</label>' + textHtml('product', f.product, '品名关键字') + '</div>' +
       '<div class="filter-field"><label>只看无记录</label><input type="checkbox" data-filter="noRecord"' + (f.noRecord ? ' checked' : '') + '></div>';
+  } else if (v === 'occupancies') {
+    const f = state.filters.occupancies;
+    const roomSel = [{ value: '', label: '全部设备' }].concat(state.rooms.map(function (r) { return { value: r.id, label: r.code + ' ' + r.name }; }));
+    const probeSel = [{ value: '', label: '全部探头' }].concat(state.probes.map(function (p) { return { value: p.id, label: p.code }; }));
+    html = '<h3>占用账筛选</h3>' +
+      '<div class="filter-field"><label>设备</label>' + selectHtml('roomId', roomSel, f.roomId) + '</div>' +
+      '<div class="filter-field"><label>探头</label>' + selectHtml('probeId', probeSel, f.probeId) + '</div>' +
+      '<div class="filter-hint">占用窗同一探头允许重叠——重叠不是录入错误，账上如实显示，交叠片内的读数按设置里的口径裁决。</div>';
   } else if (v === 'records') {
     const f = state.filters.records;
     const batchSel = [{ value: '', label: '全部' }].concat(state.batches.map(function (b) { return { value: b.id, label: b.code }; }));
@@ -633,9 +871,10 @@ function renderFilters() {
       '<div class="filter-field"><label>批次</label>' + selectHtml('batchId', batchSel, f.batchId) + '</div>' +
       '<div class="filter-field"><label>探头</label>' + selectHtml('probeId', probeSel, f.probeId) + '</div>' +
       '<div class="filter-field"><label>来源</label>' + selectHtml('source', [{ value: '', label: '全部' }].concat(SOURCE_LIST.map(function (s) { return { value: s, label: s }; })), f.source) + '</div>' +
+      '<div class="filter-field"><label>归属</label>' + selectHtml('attribution', ATTR_FILTERS, f.attribution) + '</div>' +
       '<div class="filter-field"><label>起</label><input type="datetime-local" data-filter="from" value="' + esc(f.from) + '"></div>' +
       '<div class="filter-field"><label>止</label><input type="datetime-local" data-filter="to" value="' + esc(f.to) + '"></div>' +
-      '<div class="filter-hint">不选批次时只渲染前 ' + RECORD_PAGE + ' 条；选定批次后显示该批次全部记录。</div>';
+      '<div class="filter-hint">不选批次时只渲染前 ' + RECORD_PAGE + ' 条；选定批次后显示该批次全部记录。归属存疑/窗外/对不上的记录不计入判定。</div>';
   } else if (v === 'releases') {
     const f = state.filters.releases;
     html = '<h3>台账筛选</h3>' +
@@ -660,13 +899,19 @@ function onFilterInput(e) {
 
 function openSettings() {
   const s = state.settings || {};
+  const overlapOpts = OVERLAP_POLICIES.map(function (o) { return '<option value="' + esc(o.value) + '"' + (o.value === s.overlapPolicy ? ' selected' : '') + '>' + esc(o.label) + '</option>'; }).join('');
+  const boundaryOpts = BOUNDARY_POLICIES.map(function (o) { return '<option value="' + esc(o.value) + '"' + (o.value === s.boundaryPolicy ? ' selected' : '') + '>' + esc(o.label) + '</option>'; }).join('');
   const body =
     '<div class="field"><label>温度带下限（℃）</label><input type="number" step="0.1" data-field="lowerLimitC" value="' + esc(s.lowerLimitC) + '"></div>' +
     '<div class="field"><label>温度带上限（℃）</label><input type="number" step="0.1" data-field="upperLimitC" value="' + esc(s.upperLimitC) + '"></div>' +
     '<div class="field"><label>单次允许超限（分钟）</label><input type="number" step="1" data-field="allowExcursionMinutes" value="' + esc(s.allowExcursionMinutes) + '"></div>' +
     '<div class="field"><label>累计允许超限（分钟）</label><input type="number" step="1" data-field="allowTotalExcursionMinutes" value="' + esc(s.allowTotalExcursionMinutes) + '"></div>' +
     '<div class="field"><label>断链门槛（分钟）</label><input type="number" step="1" data-field="chainGapMinutes" value="' + esc(s.chainGapMinutes) + '"></div>' +
-    '<div class="field"><label>记录间隔（分钟）</label><input type="number" step="1" data-field="recordIntervalMinutes" value="' + esc(s.recordIntervalMinutes) + '"></div>';
+    '<div class="field"><label>记录间隔（分钟）</label><input type="number" step="1" data-field="recordIntervalMinutes" value="' + esc(s.recordIntervalMinutes) + '"></div>' +
+    '<div class="field"><label>同一探头同一时段被多批占用时怎么裁</label><select data-field="overlapPolicy">' + overlapOpts + '</select>' +
+    '<div class="field-hint">逐点切：只落进一条占用窗的读数归该批，落进交叠内核的拆不开、标「存疑」两边都不计；先占先得：交叠读数判给开始更早的批次；人工裁定：交叠读数先全部存疑，逐条改判。</div></div>' +
+    '<div class="field"><label>首尾相接时边界那一时刻算谁的</label><select data-field="boundaryPolicy">' + boundaryOpts + '</select>' +
+    '<div class="field-hint">例：05:00–12:00 与 12:00–20:00 两趟，选「前一批」则 12:00:00 的读数归随车走完的前一趟，选「后一批」则归接手的后一趟。</div></div>';
   openModal('设置', body, '保存', async function () {
     const v = formValues();
     const payload = {
@@ -675,7 +920,9 @@ function openSettings() {
       allowExcursionMinutes: Number(v.allowExcursionMinutes),
       allowTotalExcursionMinutes: Number(v.allowTotalExcursionMinutes),
       chainGapMinutes: Number(v.chainGapMinutes),
-      recordIntervalMinutes: Number(v.recordIntervalMinutes)
+      recordIntervalMinutes: Number(v.recordIntervalMinutes),
+      overlapPolicy: v.overlapPolicy,
+      boundaryPolicy: v.boundaryPolicy
     };
     try {
       state.settings = await api('PATCH', '/api/settings', payload);
@@ -780,17 +1027,98 @@ function openRecordForm() {
   });
 }
 
+function nowLocalText() {
+  const d = new Date();
+  const p = function (n) { return String(n).padStart(2, '0'); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+function openOccEndForm(occ) {
+  if (!occ) return;
+  const body =
+    '<div class="field"><label>结束时刻</label><input type="text" data-field="endAt" value="' + esc(nowLocalText()) + '" placeholder="2026-09-14 12:00:00"></div>' +
+    '<div class="field-hint">占用 ' + esc(occ.batchCode) + ' / ' + esc(occ.probeCode || '无探头') + ' 自 ' + esc(occ.startAt) + ' 起进行中</div>';
+  openModal('结束占用', body, '结束占用', async function () {
+    const v = formValues();
+    try {
+      await api('PATCH', '/api/occupancies/' + encodeURIComponent(occ.id), { endAt: v.endAt });
+      closeModal();
+      await refreshAfterMutation();
+    } catch (err) { showError(err); }
+  });
+}
+
+/* ---------- 归属改判 ---------- */
+
+function findRecordAny(id) {
+  const inList = (state.recordsView || []).find(function (r) { return r.id === id; });
+  if (inList) return inList;
+  for (const bid in state.batchDetail) {
+    const d = state.batchDetail[bid];
+    const hit = (d.records || []).find(function (r) { return r.id === id; }) ||
+      (d.problemRecords || []).find(function (r) { return r.id === id; });
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function openAssignOverride(recordId) {
+  const record = findRecordAny(recordId);
+  if (!record) { showError({ message: '找不到这条记录' }); return; }
+  let occs = state.occupancies.filter(function (w) { return w.probeId === record.probeId; });
+  if (!occs.length) {
+    occs = await api('GET', '/api/occupancies?probeId=' + encodeURIComponent(record.probeId));
+  }
+  const opts = occs.map(function (w) {
+    return '<option value="' + esc(w.id) + '">' + esc(w.batchCode + '｜' + w.roomCode + '｜' + w.startAt + ' ~ ' + (w.endAt || '进行中') + (w.purpose ? '｜' + w.purpose : '')) + '</option>';
+  }).join('');
+  if (!opts) { showError({ message: '这台探头没有任何占用窗，无法改判计入；先到设备占用账登记占用' }); return; }
+  const body =
+    '<div class="field"><label>计入哪条占用</label><select data-field="occupancyId">' + opts + '</select>' +
+    '<div class="field-hint">只能改判给同一台探头的占用窗；改判后这条读数计入占用窗所属批次的判定</div></div>' +
+    '<div class="field"><label>操作人</label><input type="text" data-field="operator" value=""></div>' +
+    '<div class="field"><label>理由</label><textarea data-field="reason" placeholder="例：交接时点确认随车第二趟，现场签字"></textarea></div>' +
+    '<div class="field-hint">记录 ' + esc(record.at) + ' / ' + esc(record.probeCode) + ' / ' + num(record.temperatureC) + '℃，当前：' + esc((record.attribution && record.attribution.statusText) || '未裁决') + '</div>';
+  openModal('改判计入', body, '确认改判', async function () {
+    const v = formValues();
+    try {
+      await api('POST', '/api/attribution-overrides', { recordId, kind: 'assign', occupancyId: v.occupancyId, operator: v.operator, reason: v.reason });
+      closeModal();
+      await refreshAfterMutation();
+    } catch (err) { showError(err); }
+  });
+}
+
+function openExcludeOverride(recordId) {
+  const record = findRecordAny(recordId);
+  if (!record) { showError({ message: '找不到这条记录' }); return; }
+  const body =
+    '<div class="field"><label>操作人</label><input type="text" data-field="operator" value=""></div>' +
+    '<div class="field"><label>剔除理由</label><textarea data-field="reason" placeholder="例：探头开盖读数，不作数"></textarea></div>' +
+    '<div class="field-hint">记录 ' + esc(record.at) + ' / ' + esc(record.probeCode) + ' / ' + num(record.temperatureC) + '℃；剔除后不计入任何判定，放行第 5 条仍会计数，需另行说明或删除记录。</div>';
+  openModal('人工剔除', body, '确认剔除', async function () {
+    const v = formValues();
+    try {
+      await api('POST', '/api/attribution-overrides', { recordId, kind: 'exclude', operator: v.operator, reason: v.reason });
+      closeModal();
+      await refreshAfterMutation();
+    } catch (err) { showError(err); }
+  });
+}
+
 /* ---------- 变更后刷新 ---------- */
 
 async function loadBase() {
   const results = await Promise.all([
     api('GET', '/api/rooms'),
     api('GET', '/api/probes'),
-    api('GET', '/api/batches')
+    api('GET', '/api/batches'),
+    api('GET', '/api/occupancies')
   ]);
   state.rooms = results[0];
   state.probes = results[1];
   state.batches = results[2];
+  state.occupancies = results[3];
 }
 
 async function refreshAfterMutation() {
@@ -824,6 +1152,10 @@ async function refreshAfterMutation() {
 
 function findRoom(id) { return state.rooms.find(function (r) { return r.id === id; }) || null; }
 function findProbe(id) { return state.probes.find(function (p) { return p.id === id; }) || null; }
+function findOcc(id) {
+  return (state.occupanciesView || []).find(function (w) { return w.id === id; }) ||
+    state.occupancies.find(function (w) { return w.id === id; }) || null;
+}
 function findBatch(id) {
   return state.batches.find(function (b) { return b.id === id; }) ||
     (state.batchesView || []).find(function (b) { return b.id === id; }) || null;
@@ -889,6 +1221,30 @@ async function handleAction(action, el) {
       return;
     }
     if (action === 'record-add') { openRecordForm(); return; }
+    if (action === 'occ-add') { openOccupancyForm(null); return; }
+    if (action === 'occ-addbatch') { openOccupancyForm(null, el.dataset.id); return; }
+    if (action === 'occ-edit') { openOccupancyForm(findOcc(el.dataset.id)); return; }
+    if (action === 'occ-end') { openOccEndForm(findOcc(el.dataset.id)); return; }
+    if (action === 'occ-del') {
+      const id = el.dataset.id;
+      armDelete(el, async function () {
+        try {
+          await api('DELETE', '/api/occupancies/' + encodeURIComponent(id));
+          await refreshAfterMutation();
+        } catch (err) { showError(err); }
+      });
+      return;
+    }
+    if (action === 'ovr-assign') { openAssignOverride(el.dataset.id); return; }
+    if (action === 'ovr-exclude') { openExcludeOverride(el.dataset.id); return; }
+    if (action === 'ovr-revoke') {
+      const id = el.dataset.id;
+      try {
+        await api('DELETE', '/api/attribution-overrides/' + encodeURIComponent(id), { operator: '值班员' });
+        await refreshAfterMutation();
+      } catch (err) { showError(err); }
+      return;
+    }
     if (action === 'record-del') {
       const id = el.dataset.id;
       armDelete(el, async function () {
@@ -948,13 +1304,15 @@ async function boot() {
       api('GET', '/api/settings'),
       api('GET', '/api/rooms'),
       api('GET', '/api/probes'),
-      api('GET', '/api/batches')
+      api('GET', '/api/batches'),
+      api('GET', '/api/occupancies')
     ]);
     state.summary = results[0];
     state.settings = results[1];
     state.rooms = results[2];
     state.probes = results[3];
     state.batches = results[4];
+    state.occupancies = results[5];
     $('todayText').textContent = state.summary.today;
     renderOverview();
   } catch (err) { showError(err); }

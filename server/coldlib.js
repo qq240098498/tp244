@@ -1,5 +1,6 @@
 // 温控口径都集中在这里：超限段、断链、MKT、放行判定
 const store = require('./store');
+const attribution = require('./attribution');
 
 function toDate(text) {
   return new Date(String(text).replace(' ', 'T') + '+08:00');
@@ -16,22 +17,29 @@ function probeOf(data, probeId) {
   return data.probes.find((p) => p.id === probeId) || null;
 }
 
-// 同一探头同一时刻既有自动记录又有手工更正时，以手工为准
+// 参与判定的记录：先按占用账归属（计入本批次的，含先占先得/占用方明确时跨批计入的），
+// 再按「同一探头同一时刻自动与手工并存以手工为准」去重。
+// 先占先得可能让两批各自挂账的同一时刻读数都计入占用方，此时优先保留挂账批次就是占用方的那条。
 function effectiveRecords(data, batchId) {
-  const rows = recordsOfBatch(data, batchId);
-  const picked = {};
+  const rows = attribution.recordsChargedTo(data, batchId);
+  const picked = new Map();
   const order = [];
+  const better = (next, prev) => {
+    if ((next.batchId === batchId) !== (prev.batchId === batchId)) return next.batchId === batchId;
+    if ((next.source === '人工') !== (prev.source === '人工')) return next.source === '人工';
+    return next.id < prev.id;
+  };
   for (const row of rows) {
     const key = row.probeId + '|' + row.at;
-    if (picked[key] === undefined) {
-      picked[key] = row;
+    const prev = picked.get(key);
+    if (!prev) {
+      picked.set(key, row);
       order.push(key);
       continue;
     }
-    const current = picked[key];
-    if (current.source === '人工' && row.source === '自动') picked[key] = row;
+    if (better(row, prev)) picked.set(key, row);
   }
-  return order.map((key) => picked[key]);
+  return order.map((key) => picked.get(key));
 }
 
 // 超限：连续超出上下限的时段，回到范围内即断开
@@ -130,17 +138,21 @@ function monthlyExcursionMinutes(data, batchId) {
   return segmentStats(scoped, data.settings).totalMinutes;
 }
 
-// 放行判定：最长超限、累计超限、断链、探头校准四条
+// 放行判定：最长超限、累计超限、断链、探头校准、记录归属五条
 function releaseCheck(data, batch) {
   const settings = data.settings;
   const stats = excursionStats(data, batch.id);
   const chain = chainGaps(data, batch.id);
   const accumulated = monthlyExcursionMinutes(data, batch.id);
   const expired = expiredProbes(data, batch.id, batch.loadedAt ? String(batch.loadedAt).slice(0, 10) : '');
+  const problems = attribution.problemCounts(data, batch.id);
   const conditions = [
+    { key: 'records', ok: stats.recordCount > 0, value: stats.recordCount, limit: 1, text: '至少有 1 条参与判定的温度记录（没有温度记录的批次不能放行）' },
     { key: 'longest', ok: stats.longestMinutes <= Number(settings.allowExcursionMinutes), value: stats.longestMinutes, limit: Number(settings.allowExcursionMinutes), text: '单次连续超限不超过 ' + settings.allowExcursionMinutes + ' 分钟' },
     { key: 'total', ok: accumulated <= Number(settings.allowTotalExcursionMinutes), value: accumulated, limit: Number(settings.allowTotalExcursionMinutes), text: '累计超限不超过 ' + settings.allowTotalExcursionMinutes + ' 分钟' },
     { key: 'chain', ok: chain.gapCount === 0, value: chain.gapCount, limit: 0, text: '全程没有断链' },
+    { key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' },
+    { key: 'attribution', ok: problems.total === 0, value: problems.total, limit: 0, text: '没有归属存疑、设备对不上、占用窗外或挂错批次的记录' },
   ];
   return {
     mkt: mktCelsius(data, batch.id),
@@ -151,6 +163,7 @@ function releaseCheck(data, batch) {
     lastAt: stats.lastAt,
     chain,
     expiredProbes: expired,
+    attributionProblems: problems,
     conditions,
     pass: conditions.every((c) => c.ok),
     failed: conditions.filter((c) => !c.ok).map((c) => c.key),

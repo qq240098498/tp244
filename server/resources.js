@@ -1,12 +1,15 @@
 const { AppError } = require('./errors');
 const store = require('./store');
 const coldlib = require('./coldlib');
+const attribution = require('./attribution');
 
 const ROOM_STATUS = ['运行', '检修', '停用'];
 const ROOM_TYPE = ['冷藏库', '冷藏车', '冷冻库'];
 const PROBE_STATUS = ['在用', '停用', '送检'];
 const BATCH_STATUS = ['在库', '待放行', '已放行', '已拒收'];
 const SOURCE_LIST = ['自动', '人工'];
+const OVERLAP_POLICIES = ['window', 'first', 'manual'];
+const BOUNDARY_POLICIES = ['front', 'back'];
 
 function roomCode(data, id) {
   const room = data.rooms.find((r) => r.id === id);
@@ -54,11 +57,209 @@ function decorateBatch(data, batch) {
     mkt: check.mkt,
     chainGapCount: check.chain.gapCount,
     expiredProbeCodes: check.expiredProbes.map((p) => p.probeCode),
+    attributionProblemCount: check.attributionProblems.total,
     releaseCheck: check,
     releaseCount: releases.length,
     lastDecision: releases.length ? releases[releases.length - 1].decision : '',
   });
 }
+
+/* ---------- 设备占用账与人工改判 ---------- */
+
+function decorateOccupancy(data, occ) {
+  const map = attribution.mapFor(data);
+  let attributed = 0;
+  let disputed = 0;
+  for (const r of data.records) {
+    if (r.probeId !== occ.probeId) continue;
+    const a = map.get(r.id);
+    if (!a) continue;
+    if (a.occupancyId === occ.id && a.counted) attributed += 1;
+    if (!a.counted && a.hitOccupancyIds.indexOf(occ.id) >= 0) disputed += 1;
+  }
+  return Object.assign({}, occ, {
+    batchCode: batchCode(data, occ.batchId),
+    roomCode: roomCode(data, occ.roomId),
+    probeCode: occ.probeId ? probeCode(data, occ.probeId) : '',
+    active: occ.endAt === '',
+    attributedRecordCount: attributed,
+    disputedRecordCount: disputed,
+  });
+}
+
+function attributionInfo(data, record) {
+  const a = attribution.mapFor(data).get(record.id);
+  if (!a) return null;
+  const override = data.attributionOverrides.find((o) => o.recordId === record.id && !o.revokedAt && !o.supersededAt);
+  return {
+    status: a.status,
+    statusText: attribution.STATUS_TEXT[a.status] || a.status,
+    counted: a.counted,
+    boundary: a.boundary,
+    occupancyId: a.occupancyId,
+    chargedBatchId: a.chargedBatchId,
+    chargedBatchCode: a.chargedBatchId ? batchCode(data, a.chargedBatchId) : '',
+    hitOccupancyIds: a.hitOccupancyIds,
+    overrideId: override ? override.id : '',
+    basis: a.basis,
+  };
+}
+
+function listOccupancies(data, query) {
+  const q = query || {};
+  let rows = data.occupancies.slice();
+  if (q.batchId) rows = rows.filter((w) => w.batchId === q.batchId);
+  if (q.roomId) rows = rows.filter((w) => w.roomId === q.roomId);
+  if (q.probeId) rows = rows.filter((w) => w.probeId === q.probeId);
+  if (q.active === 'true') rows = rows.filter((w) => w.endAt === '');
+  if (q.active === 'false') rows = rows.filter((w) => w.endAt !== '');
+  return rows.map((w) => decorateOccupancy(data, w))
+    .sort((a, b) => (a.startAt < b.startAt ? -1 : a.startAt > b.startAt ? 1 : (a.id < b.id ? -1 : 1)));
+}
+
+const TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+function validateOccupancy(data, payload, current) {
+  const merged = Object.assign({}, current || {}, payload || {});
+  const errors = {};
+  if (!data.batches.some((b) => b.id === merged.batchId)) errors.batchId = '批次不存在';
+  if (!data.rooms.some((r) => r.id === merged.roomId)) errors.roomId = '设备（冷库/车厢）不存在';
+  if (merged.probeId) {
+    if (!data.probes.some((p) => p.id === merged.probeId)) errors.probeId = '探头不存在';
+  }
+  if (!TIME_RE.test(String(merged.startAt || ''))) errors.startAt = '开始时刻格式要像 2026-09-14 05:00:00';
+  if (merged.endAt) {
+    if (!TIME_RE.test(String(merged.endAt))) errors.endAt = '结束时刻格式要像 2026-09-14 12:00:00，留空表示进行中';
+    else if (String(merged.endAt) <= String(merged.startAt)) errors.endAt = '结束时刻要晚于开始时刻';
+  }
+  if (current && payload.batchId !== undefined && payload.batchId !== current.batchId) {
+    errors.batchId = '占用窗的批次不能改，要换批次请新开一条';
+  }
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '占用账没通过校验', errors);
+}
+
+function createOccupancy(data, payload) {
+  validateOccupancy(data, payload, null);
+  const occ = {
+    id: store.nextId('oc', data.occupancies),
+    batchId: payload.batchId,
+    roomId: payload.roomId,
+    probeId: payload.probeId || '',
+    startAt: String(payload.startAt),
+    endAt: payload.endAt ? String(payload.endAt) : '',
+    purpose: String(payload.purpose || '').trim(),
+    remark: String(payload.remark || '').trim(),
+  };
+  data.occupancies.push(occ);
+  attribution.invalidate(data);
+  return decorateOccupancy(data, occ);
+}
+
+function updateOccupancy(data, id, payload) {
+  const occ = data.occupancies.find((w) => w.id === id);
+  if (!occ) throw new AppError(404, 'OCCUPANCY_NOT_FOUND', '这条设备占用不存在');
+  validateOccupancy(data, payload, occ);
+  const merged = Object.assign({}, occ, payload);
+  Object.assign(occ, {
+    roomId: merged.roomId,
+    probeId: merged.probeId || '',
+    startAt: String(merged.startAt),
+    endAt: merged.endAt ? String(merged.endAt) : '',
+    purpose: String(merged.purpose || '').trim(),
+    remark: String(merged.remark || '').trim(),
+  });
+  attribution.invalidate(data);
+  return decorateOccupancy(data, occ);
+}
+
+// 删占用窗不拦：窗删掉后记录会重算成占用窗外/存疑，账要如实变。
+// 指向这条窗的生效改判随窗软撤销，留痕。
+function removeOccupancy(data, id) {
+  const occ = data.occupancies.find((w) => w.id === id);
+  if (!occ) throw new AppError(404, 'OCCUPANCY_NOT_FOUND', '这条设备占用不存在');
+  let revoked = 0;
+  for (const o of data.attributionOverrides) {
+    if (!o.revokedAt && !o.supersededAt && o.kind === 'assign' && o.occupancyId === id) {
+      o.revokedAt = store.nowText();
+      o.revokedBy = '系统';
+      o.revokedReason = '占用窗已删除';
+      revoked += 1;
+    }
+  }
+  data.occupancies = data.occupancies.filter((w) => w.id !== id);
+  attribution.invalidate(data);
+  return { removed: id, revokedOverrideCount: revoked };
+}
+
+function decorateOverride(data, o) {
+  const record = data.records.find((r) => r.id === o.recordId);
+  const occ = data.occupancies.find((w) => w.id === o.occupancyId);
+  return Object.assign({}, o, {
+    active: !o.revokedAt && !o.supersededAt,
+    recordAt: record ? record.at : '',
+    probeCode: record ? probeCode(data, record.probeId) : '',
+    batchCode: record ? batchCode(data, record.batchId) : '',
+    occupancyBatchCode: occ ? batchCode(data, occ.batchId) : '',
+  });
+}
+
+function listOverrides(data, query) {
+  const q = query || {};
+  let rows = data.attributionOverrides.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  if (q.recordId) rows = rows.filter((o) => o.recordId === q.recordId);
+  if (q.active === 'true') rows = rows.filter((o) => !o.revokedAt && !o.supersededAt);
+  if (q.active === 'false') rows = rows.filter((o) => o.revokedAt || o.supersededAt);
+  return rows.map((o) => decorateOverride(data, o));
+}
+
+function createOverride(data, payload) {
+  const errors = {};
+  const record = data.records.find((r) => r.id === payload.recordId);
+  if (!record) errors.recordId = '温度记录不存在';
+  if (!['assign', 'exclude'].includes(payload.kind)) errors.kind = '改判只能是 assign（计入某占用）或 exclude（剔除）';
+  if (!String(payload.operator || '').trim()) errors.operator = '操作人要填';
+  if (!String(payload.reason || '').trim()) errors.reason = '改判理由要填';
+  let occ = null;
+  if (payload.kind === 'assign') {
+    occ = data.occupancies.find((w) => w.id === payload.occupancyId);
+    if (!occ) errors.occupancyId = '改判目标占用窗不存在';
+    else if (record && occ.probeId !== record.probeId) errors.occupancyId = '改判占用窗必须是同一台探头';
+  }
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '改判没通过校验', errors);
+
+  // 同一条记录只保留一条生效改判，旧的标 superseded 留痕
+  for (const old of data.attributionOverrides) {
+    if (old.recordId === payload.recordId && !old.revokedAt && !old.supersededAt) old.supersededAt = store.nowText();
+  }
+  const override = {
+    id: store.nextId('ao', data.attributionOverrides),
+    recordId: payload.recordId,
+    kind: payload.kind,
+    occupancyId: payload.kind === 'assign' ? occ.id : '',
+    reason: String(payload.reason).trim(),
+    operator: String(payload.operator).trim(),
+    createdAt: store.nowText(),
+    revokedAt: '',
+    revokedBy: '',
+    revokedReason: '',
+    supersededAt: '',
+  };
+  data.attributionOverrides.push(override);
+  attribution.invalidate(data);
+  return decorateOverride(data, override);
+}
+
+function revokeOverride(data, id, payload) {
+  const override = data.attributionOverrides.find((o) => o.id === id);
+  if (!override) throw new AppError(404, 'OVERRIDE_NOT_FOUND', '这条改判不存在');
+  if (override.revokedAt || override.supersededAt) throw new AppError(409, 'OVERRIDE_INACTIVE', '这条改判已经撤销或被新改判替代');
+  override.revokedAt = store.nowText();
+  override.revokedBy = String((payload && payload.operator) || '').trim() || '值班员';
+  override.revokedReason = String((payload && payload.reason) || '').trim();
+  attribution.invalidate(data);
+  return { revoked: id, revokedAt: override.revokedAt };
+}
+
 
 function listRooms(data, query) {
   const q = query || {};
@@ -126,8 +327,10 @@ function updateRoom(data, id, payload) {
 function removeRoom(data, id) {
   const room = data.rooms.find((r) => r.id === id);
   if (!room) throw new AppError(404, 'ROOM_NOT_FOUND', '这个冷库或者车厢不存在');
-  const used = data.probes.filter((p) => p.roomId === id).length + data.batches.filter((b) => b.roomId === id).length;
-  if (used > 0) throw new AppError(409, 'ROOM_IN_USE', '名下还有 ' + used + ' 条探头或者批次，不能删除', { count: used });
+  const used = data.probes.filter((p) => p.roomId === id).length +
+    data.batches.filter((b) => b.roomId === id).length +
+    data.occupancies.filter((w) => w.roomId === id).length;
+  if (used > 0) throw new AppError(409, 'ROOM_IN_USE', '名下还有 ' + used + ' 条探头、批次或者设备占用，不能删除', { count: used });
   data.rooms = data.rooms.filter((r) => r.id !== id);
   return { removed: id };
 }
@@ -184,7 +387,10 @@ function removeProbe(data, id) {
   const probe = data.probes.find((p) => p.id === id);
   if (!probe) throw new AppError(404, 'PROBE_NOT_FOUND', '这个探头不存在');
   const used = data.records.filter((r) => r.probeId === id).length;
-  if (used > 0) throw new AppError(409, 'PROBE_IN_USE', '这个探头名下还有 ' + used + ' 条温度记录，不能删除', { count: used });
+  const occUsed = data.occupancies.filter((w) => w.probeId === id).length;
+  if (used > 0 || occUsed > 0) {
+    throw new AppError(409, 'PROBE_IN_USE', '这个探头名下还有 ' + used + ' 条温度记录、' + occUsed + ' 条设备占用，不能删除', { recordCount: used, occupancyCount: occUsed });
+  }
   data.probes = data.probes.filter((p) => p.id !== id);
   return { removed: id };
 }
@@ -205,12 +411,28 @@ function batchDetail(data, id) {
   const rows = coldlib.recordsOfBatch(data, id).map((r) => Object.assign({}, r, {
     probeCode: probeCode(data, r.probeId),
     probeExpired: !coldlib.probeValidOn(coldlib.probeOf(data, r.probeId), String(r.at).slice(0, 10)),
+    attribution: attributionInfo(data, r),
   }));
+  const problems = attribution.problemRecords(data, id).map(function (item) {
+    return Object.assign({}, item.record, {
+      probeCode: probeCode(data, item.record.probeId),
+      attribution: Object.assign({}, item.attribution, { statusText: attribution.STATUS_TEXT[item.attribution.status] || item.attribution.status }),
+    });
+  });
+  const occupancies = data.occupancies
+    .filter((w) => w.batchId === id)
+    .map((w) => decorateOccupancy(data, w))
+    .sort((a, b) => (a.startAt < b.startAt ? -1 : 1));
   return Object.assign({}, decorateBatch(data, batch), {
     records: rows,
-    effectiveRecords: coldlib.effectiveRecords(data, id).map((r) => Object.assign({}, r, { probeCode: probeCode(data, r.probeId) })),
+    effectiveRecords: coldlib.effectiveRecords(data, id).map((r) => Object.assign({}, r, {
+      probeCode: probeCode(data, r.probeId),
+      attribution: attributionInfo(data, r),
+    })),
     segments: coldlib.excursionStats(data, id).segments,
     chainGaps: coldlib.chainGaps(data, id).gaps,
+    occupancies,
+    problemRecords: problems,
     releases: data.releases.filter((r) => r.batchId === id).slice().sort((a, b) => (a.decidedAt < b.decidedAt ? 1 : -1)),
   });
 }
@@ -268,12 +490,31 @@ function removeBatch(data, id) {
   const batch = data.batches.find((b) => b.id === id);
   if (!batch) throw new AppError(404, 'BATCH_NOT_FOUND', '这个批次不存在');
   if (batch.status === '已放行') throw new AppError(409, 'BATCH_RELEASED', '这个批次已经放行，不能直接删除', { code: batch.code });
-  const used = data.records.filter((r) => r.batchId === id).length;
+  const recordIds = new Set(data.records.filter((r) => r.batchId === id).map((r) => r.id));
+  const occIds = new Set(data.occupancies.filter((w) => w.batchId === id).map((w) => w.id));
+  const used = recordIds.size;
+  const removedOccupancies = occIds.size;
+  // 指向被删占用窗的改判软撤销；指向被删记录的改判硬删（审计对象已不存在）
+  let revokedOverrides = 0;
+  data.attributionOverrides = data.attributionOverrides.filter((o) => {
+    if (recordIds.has(o.recordId)) return false;
+    if (o.kind === 'assign' && occIds.has(o.occupancyId) && !o.revokedAt && !o.supersededAt) {
+      o.revokedAt = store.nowText();
+      o.revokedBy = '系统';
+      o.revokedReason = '批次与占用窗已删除';
+      revokedOverrides += 1;
+    }
+    return true;
+  });
   data.records = data.records.filter((r) => r.batchId !== id);
+  data.occupancies = data.occupancies.filter((w) => w.batchId !== id);
   data.releases = data.releases.filter((r) => r.batchId !== id);
   data.batches = data.batches.filter((b) => b.id !== id);
-  return { removed: id, removedRecords: used };
+  attribution.invalidate(data);
+  return { removed: id, removedRecords: used, removedOccupancies, revokedOverrides };
 }
+
+const PROBLEM_STATUS = ['disputed', 'out-of-window', 'device-mismatch', 'wrong-batch', 'manual-excluded'];
 
 function listRecords(data, query) {
   const q = query || {};
@@ -283,13 +524,17 @@ function listRecords(data, query) {
   if (q.source) rows = rows.filter((r) => r.source === q.source);
   if (q.from) rows = rows.filter((r) => r.at >= q.from);
   if (q.to) rows = rows.filter((r) => r.at <= q.to);
-  return rows
+  let decorated = rows
     .map((r) => Object.assign({}, r, {
       batchCode: batchCode(data, r.batchId),
       probeCode: probeCode(data, r.probeId),
       outOfRange: Number(r.temperatureC) > Number(data.settings.upperLimitC) || Number(r.temperatureC) < Number(data.settings.lowerLimitC),
+      attribution: attributionInfo(data, r),
     }))
     .sort((a, b) => (a.at < b.at ? 1 : -1));
+  if (q.status) decorated = decorated.filter((r) => r.attribution && r.attribution.status === q.status);
+  if (q.onlyProblems === 'true') decorated = decorated.filter((r) => r.attribution && PROBLEM_STATUS.indexOf(r.attribution.status) >= 0);
+  return decorated;
 }
 
 function validateRecord(data, payload) {
@@ -318,13 +563,16 @@ function createRecord(data, payload) {
     remark: String(payload.remark || ''),
   };
   data.records.push(record);
+  attribution.invalidate(data);
   return Object.assign({}, record, { batchCode: batchCode(data, record.batchId), probeCode: probeCode(data, record.probeId) });
 }
 
 function removeRecord(data, id) {
   const record = data.records.find((r) => r.id === id);
   if (!record) throw new AppError(404, 'RECORD_NOT_FOUND', '这条温度记录不存在');
+  data.attributionOverrides = data.attributionOverrides.filter((o) => o.recordId !== id);
   data.records = data.records.filter((r) => r.id !== id);
+  attribution.invalidate(data);
   return { removed: id };
 }
 
@@ -359,6 +607,7 @@ function decide(data, batchId, payload) {
     longestExcursionMinutes: check.longestMinutes,
     totalExcursionMinutes: check.totalMinutes,
     chainGapCount: check.chain.gapCount,
+    attributionProblemCount: check.attributionProblems.total,
     basis: String(payload.basis || '').trim(),
     remark: String(payload.remark || ''),
   };
@@ -374,5 +623,8 @@ module.exports = {
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
+  listOccupancies, createOccupancy, updateOccupancy, removeOccupancy,
+  listOverrides, createOverride, revokeOverride,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,
+  OVERLAP_POLICIES, BOUNDARY_POLICIES,
 };

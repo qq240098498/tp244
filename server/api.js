@@ -3,8 +3,19 @@ const store = require('./store');
 const { AppError } = require('./errors');
 const res = require('./resources');
 const coldlib = require('./coldlib');
+const attribution = require('./attribution');
 
 const router = express.Router();
+
+function coldlibTimeline(data, query) {
+  const t = attribution.timeline(data, query);
+  return Object.assign({}, t, {
+    overlapPolicy: data.settings.overlapPolicy,
+    boundaryPolicy: data.settings.boundaryPolicy,
+    overlapPolicyText: attribution.OVERLAP_POLICY_TEXT[data.settings.overlapPolicy],
+    boundaryPolicyText: attribution.BOUNDARY_POLICY_TEXT[data.settings.boundaryPolicy],
+  });
+}
 
 function withData(handler) {
   return (req, reqRes, next) => {
@@ -33,6 +44,7 @@ function overview(data) {
   const readyToRelease = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && d.check.pass).length;
   const blockedCount = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && !d.check.pass).length;
   const noRecordBatches = data.batches.filter((b) => !data.records.some((r) => r.batchId === b.id)).length;
+  const attributionProblemBatches = decorated.filter((d) => d.check.attributionProblems && d.check.attributionProblems.total > 0).length;
   const expiredProbes = data.probes.filter((p) => !coldlib.probeValidOn(p, store.nowText().slice(0, 10))).length;
   const mktValues = decorated.map((d) => d.check.mkt).filter((v) => v > 0);
   return {
@@ -53,6 +65,7 @@ function overview(data) {
     readyToRelease,
     blockedCount,
     noRecordBatches,
+    attributionProblemBatchCount: attributionProblemBatches,
     maxMkt: mktValues.length ? store.round(Math.max.apply(null, mktValues)) : 0,
     averageMkt: mktValues.length ? store.round(mktValues.reduce((a, b) => a + b, 0) / mktValues.length) : 0,
     settings: {
@@ -62,6 +75,8 @@ function overview(data) {
       allowTotalExcursionMinutes: Number(settings.allowTotalExcursionMinutes),
       chainGapMinutes: Number(settings.chainGapMinutes),
       recordIntervalMinutes: Number(settings.recordIntervalMinutes),
+      overlapPolicy: settings.overlapPolicy,
+      boundaryPolicy: settings.boundaryPolicy,
     },
     rooms: data.rooms.map((r) => {
       const probes = data.probes.filter((p) => p.roomId === r.id);
@@ -80,6 +95,14 @@ router.get('/summary', withData((data) => overview(data)));
 router.get('/settings', withData((data) => data.settings));
 router.patch('/settings', withData((data, req) => {
   const patch = req.body || {};
+  const details = {};
+  if (patch.overlapPolicy !== undefined && res.OVERLAP_POLICIES.indexOf(patch.overlapPolicy) < 0) {
+    details.overlapPolicy = '交叠裁决只能是：' + res.OVERLAP_POLICIES.join('、');
+  }
+  if (patch.boundaryPolicy !== undefined && res.BOUNDARY_POLICIES.indexOf(patch.boundaryPolicy) < 0) {
+    details.boundaryPolicy = '边界时刻只能是：' + res.BOUNDARY_POLICIES.join('、');
+  }
+  if (Object.keys(details).length) throw new AppError(400, 'VALIDATION_FAILED', '设置没通过校验', details);
   for (const key of Object.keys(store.DEFAULT_SETTINGS)) if (patch[key] !== undefined) data.settings[key] = patch[key];
   return { __save: true, __body: data.settings };
 }));
@@ -110,6 +133,16 @@ router.post('/batches/:id/decision', withData((data, req) => ({ __save: true, __
 router.get('/records', withData((data, req) => res.listRecords(data, req.query)));
 router.post('/records', withData((data, req) => ({ __save: true, __body: res.createRecord(data, req.body || {}) })));
 router.delete('/records/:id', withData((data, req) => ({ __save: true, __body: res.removeRecord(data, req.params.id) })));
+
+router.get('/occupancies', withData((data, req) => res.listOccupancies(data, req.query)));
+router.post('/occupancies', withData((data, req) => ({ __save: true, __body: res.createOccupancy(data, req.body || {}) })));
+router.get('/occupancies/timeline', withData((data, req) => coldlibTimeline(data, req.query)));
+router.patch('/occupancies/:id', withData((data, req) => ({ __save: true, __body: res.updateOccupancy(data, req.params.id, req.body || {}) })));
+router.delete('/occupancies/:id', withData((data, req) => ({ __save: true, __body: res.removeOccupancy(data, req.params.id) })));
+
+router.get('/attribution-overrides', withData((data, req) => res.listOverrides(data, req.query)));
+router.post('/attribution-overrides', withData((data, req) => ({ __save: true, __body: res.createOverride(data, req.body || {}) })));
+router.delete('/attribution-overrides/:id', withData((data, req) => ({ __save: true, __body: res.revokeOverride(data, req.params.id, req.body || {}) })));
 
 router.get('/releases', withData((data, req) => res.listReleases(data, req.query)));
 
